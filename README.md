@@ -18,8 +18,8 @@ which looks like `-1001234567890`.
 ## 2. Configure environment variables
 
 ```bash
-export TELEGRAM_BOT_TOKEN="8888992002:AAFcfUGpio6PeSPt0Z9sNK7fhlXgH9GStJ0"
-export TELEGRAM_CHAT_ID="-1004496290237"
+export TELEGRAM_BOT_TOKEN="123456789:ABCdefGhIJKlmNoPQRstuVWXyz"
+export TELEGRAM_CHAT_ID="-1001234567890"
 export SAMSARA_WEBHOOK_SECRET="your-shared-secret"   # optional but recommended
 ```
 
