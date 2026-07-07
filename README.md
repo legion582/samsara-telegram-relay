@@ -6,13 +6,13 @@ safety-related ones to a Telegram channel.
 ## 1. Create your Telegram bot
 
 1. Message **@BotFather** on Telegram, run `/newbot`, follow the prompts.
-2. Save the bot token it gives you 8888992002:AAFcfUGpio6PeSPt0Z9sNK7fhlXgH9GStJ0
+2. Save the bot token it gives you 
 (looks like `123456789:ABCdefGhIJKlmNoPQRstuVWXyz`).
 3. Create (or use an existing) Telegram **channel**.
 4. Add your bot to the channel as an **administrator** (needed for it to post).
 5. Get the channel's chat ID:
    - Post any message in the channel.
-   - Forward that message to **@userinfobot** (or **@RawDataBot**) — it will show you the channel's numeric ID, -1004496290237
+   - Forward that message to **@userinfobot** (or **@RawDataBot**) — it will show you the channel's numeric ID, 
 which looks like `-1001234567890`.
 
 ## 2. Configure environment variables
