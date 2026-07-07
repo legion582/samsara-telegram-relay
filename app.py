@@ -13,6 +13,7 @@ Required environment variables:
 
 import os
 import hmac
+import base64
 import hashlib
 import logging
 import requests
@@ -39,22 +40,37 @@ SAFETY_EVENT_TYPES = {
 }
 
 
-def verify_signature(raw_body: bytes, signature_header: str) -> bool:
+def verify_signature(raw_body: bytes, timestamp: str, signature_header: str) -> bool:
     """
     Verify the request actually came from Samsara using the shared secret.
-    Samsara signs webhook payloads with HMAC-SHA256; check their webhook
-    docs for the exact header name they use for your account
-    (commonly 'X-Samsara-Signature').
+
+    Per Samsara's webhook docs (https://developers.samsara.com/docs/webhooks):
+      - The secret key shown on the webhook config page is Base64 encoded
+        and must be decoded before use.
+      - The signature is HMAC-SHA256 over the message: "v1:<timestamp>:<body>"
+        where <timestamp> is the X-Samsara-Timestamp header value.
+      - The X-Samsara-Signature header value looks like "v1=<hex signature>".
+
     Skips verification if no secret is configured.
     """
     if not SAMSARA_WEBHOOK_SECRET:
         return True
-    if not signature_header:
+    if not signature_header or not timestamp:
         return False
-    computed = hmac.new(
-        SAMSARA_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(computed, signature_header)
+    if not signature_header.startswith("v1="):
+        return False
+
+    provided_signature = signature_header[len("v1="):]
+
+    try:
+        decoded_secret = base64.b64decode(SAMSARA_WEBHOOK_SECRET)
+    except Exception:
+        log.error("SAMSARA_WEBHOOK_SECRET is not valid base64")
+        return False
+
+    message = f"v1:{timestamp}:{raw_body.decode('utf-8')}".encode("utf-8")
+    computed = hmac.new(decoded_secret, message, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(computed, provided_signature)
 
 
 def format_message(payload: dict) -> str:
@@ -101,8 +117,9 @@ def send_to_telegram(text: str):
 def samsara_webhook():
     raw_body = request.get_data()
     signature = request.headers.get("X-Samsara-Signature", "")
+    timestamp = request.headers.get("X-Samsara-Timestamp", "")
 
-    if not verify_signature(raw_body, signature):
+    if not verify_signature(raw_body, timestamp, signature):
         log.warning("Rejected webhook with invalid signature")
         return jsonify({"error": "invalid signature"}), 401
 
