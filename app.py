@@ -1,166 +1,605 @@
 """
-Samsara -> Telegram safety alert relay.
+Samsara -> Telegram relay for Western Cargo
+- Verifies Samsara webhook signatures
+- Sends instant text alerts to a Telegram group (geofence entry, stopped vehicle, safety events)
+- For selected safety behaviors (speeding, rolling stop, etc.), retrieves dashcam video
+  via the Samsara Media Retrieval API and sends the clip to the group when it's ready.
 
-Receives webhook POSTs from Samsara, formats safety-related events,
-and forwards them as messages to a Telegram channel via a bot.
+Required environment variables (Render -> Environment):
+  SAMSARA_SIGNING_SECRET   webhook signing secret from Samsara (base64 string as shown)
+  SAMSARA_API_TOKEN        API token with: Read Safety Events & Scores, Read Camera Media,
+                           Write Media Retrieval, Read Media Retrieval
+  TELEGRAM_BOT_TOKEN       your bot token (keep it ONLY here - never in code)
+  TELEGRAM_CHAT_ID         group chat id, e.g. -1001234567890
 
-Required environment variables:
-  TELEGRAM_BOT_TOKEN   - token from @BotFather
-  TELEGRAM_CHAT_ID     - target channel/chat id (e.g. -1001234567890)
-  SAMSARA_WEBHOOK_SECRET - (optional but recommended) shared secret Samsara
-                            sends back so you can verify the request is genuine
+Optional:
+  DATABASE_URL             Render Postgres URL. If set, pending video jobs survive
+                           restarts/redeploys. If not set, jobs are held in memory
+                           (a redeploy during the wait window will drop them).
+  VIDEO_BEHAVIORS          comma-separated keywords that trigger video retrieval.
+                           Default: "speeding,rolling stop,stop sign,ran red light,harsh"
+  VIDEO_DELAY_MINUTES      how long to wait before requesting footage (default 5)
 """
 
-import os
-import hmac
 import base64
 import hashlib
-import logging
+import hmac
+import json
+import os
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, abort
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("samsara-telegram-relay")
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-SAMSARA_WEBHOOK_SECRET = os.environ.get("SAMSARA_WEBHOOK_SECRET")  # optional
+SAMSARA_SIGNING_SECRET = os.environ.get("SAMSARA_SIGNING_SECRET", "")
+SAMSARA_API_TOKEN = os.environ.get("SAMSARA_API_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+VIDEO_DELAY_MINUTES = int(os.environ.get("VIDEO_DELAY_MINUTES", "5"))
 
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+VIDEO_BEHAVIORS = [
+    s.strip().lower()
+    for s in os.environ.get(
+        "VIDEO_BEHAVIORS",
+        "speeding,rolling stop,stop sign,ran red light,harsh",
+    ).split(",")
+    if s.strip()
+]
 
-# Event types you care about. These must exactly match the event
-# subscriptions you enabled in Samsara's webhook configuration
-# (Settings > Webhooks > Edit Webhook > Event Subscriptions).
-SAFETY_EVENT_TYPES = {
-    "SevereSpeedingStarted",
-    "SevereSpeedingEnded",
-    "SpeedingEventStarted",
-    "SpeedingEventEnded",
-    "EngineFaultOn",
-    "EngineFaultOff",
-    "PredictiveMaintenanceAlert",
-}
+LOCAL_TZ = ZoneInfo(os.environ.get("LOCAL_TZ", "America/Chicago"))  # Texas time
+
+# Skip "...Ended" events by default - the Started alert already told the group
+SKIP_ENDED = os.environ.get("SKIP_ENDED", "true").lower() == "true"
+
+# Friendly labels + emojis for common event types
+EVENT_STYLES = [
+    ("severespeeding", "🚨🏎 SEVERE SPEEDING"),
+    ("speeding",       "⚠️🏎 Speeding"),
+    ("harshbrak",      "⚠️🛑 Harsh Braking"),
+    ("harshaccel",     "⚠️💨 Harsh Acceleration"),
+    ("harshturn",      "⚠️↩️ Harsh Turn"),
+    ("rolling stop",   "🚫🛑 Rolling Stop"),
+    ("stop sign",      "🚫🛑 Ran Stop Sign"),
+    ("red light",      "🚦❌ Ran Red Light"),
+    ("crash",          "💥 POSSIBLE CRASH"),
+    ("geofence entry", "🚧 ENTERED RESTRICTED ZONE"),
+    ("geofence exit",  "🚧 Left Zone"),
+    ("geofence",       "🚧 Restricted Zone Alert"),
+    ("stopped",        "🅿️⏱ Stopped 15+ min"),
+    ("idle",           "🅿️⏱ Idling Alert"),
+    ("phone",          "📵 Phone Use While Driving"),
+    ("seatbelt",       "🔴 No Seatbelt"),
+    ("tailgating",     "↔️ Tailgating"),
+    ("following",      "↔️ Following Too Close"),
+]
+
+# Dedupe: don't send the same (vehicle, label) twice within this many seconds
+DEDUPE_SECONDS = int(os.environ.get("DEDUPE_SECONDS", "120"))
+_recent_alerts = {}
+_recent_lock = threading.Lock()
+
+SAMSARA_API = "https://api.samsara.com"
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+TELEGRAM_MAX_UPLOAD = 50 * 1024 * 1024  # 50 MB bot upload limit
 
 
-def verify_signature(raw_body: bytes, timestamp: str, signature_header: str) -> bool:
-    """
-    Verify the request actually came from Samsara using the shared secret.
+# ---------------------------------------------------------------------------
+# Job store: Postgres if DATABASE_URL is set, otherwise in-memory fallback
+# ---------------------------------------------------------------------------
 
-    Per Samsara's webhook docs (https://developers.samsara.com/docs/webhooks):
-      - The secret key shown on the webhook config page is Base64 encoded
-        and must be decoded before use.
-      - The signature is HMAC-SHA256 over the message: "v1:<timestamp>:<body>"
-        where <timestamp> is the X-Samsara-Timestamp header value.
-      - The X-Samsara-Signature header value looks like "v1=<hex signature>".
+_mem_jobs = []
+_mem_lock = threading.Lock()
+_pg_conn = None
 
-    Skips verification if no secret is configured.
-    """
-    if not SAMSARA_WEBHOOK_SECRET:
-        return True
-    if not signature_header or not timestamp:
-        return False
-    if not signature_header.startswith("v1="):
-        return False
 
-    provided_signature = signature_header[len("v1="):]
+def _pg():
+    """Return a live psycopg2 connection, reconnecting if needed."""
+    global _pg_conn
+    import psycopg2
 
+    if _pg_conn is None or _pg_conn.closed:
+        _pg_conn = psycopg2.connect(DATABASE_URL)
+        _pg_conn.autocommit = True
+    return _pg_conn
+
+
+def init_store():
+    if not DATABASE_URL:
+        print("WARNING: DATABASE_URL not set - video jobs held in memory only.")
+        return
+    with _pg().cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS video_jobs (
+                id SERIAL PRIMARY KEY,
+                vehicle_id TEXT,
+                vehicle_name TEXT,
+                behavior TEXT,
+                event_time TIMESTAMPTZ,
+                next_check TIMESTAMPTZ,
+                retrieval_id TEXT,
+                attempts INT DEFAULT 0,
+                status TEXT DEFAULT 'pending'
+            )
+            """
+        )
+
+
+def add_job(vehicle_id, vehicle_name, behavior, event_time):
+    next_check = datetime.now(timezone.utc) + timedelta(minutes=VIDEO_DELAY_MINUTES)
+    if DATABASE_URL:
+        with _pg().cursor() as cur:
+            cur.execute(
+                "INSERT INTO video_jobs (vehicle_id, vehicle_name, behavior, event_time, next_check)"
+                " VALUES (%s, %s, %s, %s, %s)",
+                (vehicle_id, vehicle_name, behavior, event_time, next_check),
+            )
+    else:
+        with _mem_lock:
+            _mem_jobs.append(
+                {
+                    "id": len(_mem_jobs) + 1,
+                    "vehicle_id": vehicle_id,
+                    "vehicle_name": vehicle_name,
+                    "behavior": behavior,
+                    "event_time": event_time,
+                    "next_check": next_check,
+                    "retrieval_id": None,
+                    "attempts": 0,
+                    "status": "pending",
+                }
+            )
+
+
+def due_jobs():
+    now = datetime.now(timezone.utc)
+    if DATABASE_URL:
+        with _pg().cursor() as cur:
+            cur.execute(
+                "SELECT id, vehicle_id, vehicle_name, behavior, event_time, retrieval_id, attempts"
+                " FROM video_jobs WHERE status IN ('pending','requested') AND next_check <= %s",
+                (now,),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "id": r[0], "vehicle_id": r[1], "vehicle_name": r[2],
+                "behavior": r[3], "event_time": r[4],
+                "retrieval_id": r[5], "attempts": r[6],
+            }
+            for r in rows
+        ]
+    with _mem_lock:
+        return [dict(j) for j in _mem_jobs
+                if j["status"] in ("pending", "requested") and j["next_check"] <= now]
+
+
+def update_job(job_id, **fields):
+    if DATABASE_URL:
+        sets = ", ".join(f"{k} = %s" for k in fields)
+        with _pg().cursor() as cur:
+            cur.execute(
+                f"UPDATE video_jobs SET {sets} WHERE id = %s",
+                list(fields.values()) + [job_id],
+            )
+    else:
+        with _mem_lock:
+            for j in _mem_jobs:
+                if j["id"] == job_id:
+                    j.update(fields)
+
+
+# ---------------------------------------------------------------------------
+# Telegram helpers
+# ---------------------------------------------------------------------------
+
+def tg_send_text(text):
     try:
-        decoded_secret = base64.b64decode(SAMSARA_WEBHOOK_SECRET)
-    except Exception:
-        log.error("SAMSARA_WEBHOOK_SECRET is not valid base64")
+        r = requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=15,
+        )
+        if not r.ok:
+            print("Telegram sendMessage failed:", r.status_code, r.text[:300])
+    except Exception as e:
+        print("Telegram sendMessage error:", e)
+
+
+def tg_send_video(url, caption):
+    """Download the clip and upload to Telegram; fall back to sending the link."""
+    try:
+        vid = requests.get(url, timeout=120)
+        vid.raise_for_status()
+        if len(vid.content) <= TELEGRAM_MAX_UPLOAD:
+            r = requests.post(
+                f"{TELEGRAM_API}/sendVideo",
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                files={"video": ("clip.mp4", vid.content, "video/mp4")},
+                timeout=180,
+            )
+            if r.ok:
+                return True
+            print("Telegram sendVideo failed:", r.status_code, r.text[:300])
+        # Too big or upload failed: send the (8-hour) link instead
+        tg_send_text(f"{caption}\nVideo (link expires in 8h): {url}")
+        return True
+    except Exception as e:
+        print("tg_send_video error:", e)
+        tg_send_text(f"{caption}\nVideo (link expires in 8h): {url}")
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Samsara signature verification
+# ---------------------------------------------------------------------------
+
+def verify_signature(req):
+    timestamp = req.headers.get("X-Samsara-Timestamp", "")
+    signature = req.headers.get("X-Samsara-Signature", "")
+    if not timestamp or not signature:
         return False
+    secret = base64.b64decode(SAMSARA_SIGNING_SECRET)
+    message = b"v1:" + timestamp.encode() + b":" + req.get_data()
+    expected = "v1=" + hmac.new(secret, message, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
 
-    message = f"v1:{timestamp}:{raw_body.decode('utf-8')}".encode("utf-8")
-    computed = hmac.new(decoded_secret, message, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(computed, provided_signature)
+
+# ---------------------------------------------------------------------------
+# Webhook parsing
+# ---------------------------------------------------------------------------
+
+def dig(d, *keys, default=None):
+    """Safely walk nested dicts and lists."""
+    for k in keys:
+        if isinstance(d, dict) and k in d:
+            d = d[k]
+        elif isinstance(d, list) and isinstance(k, int) and len(d) > k:
+            d = d[k]
+        else:
+            return default
+    return d
 
 
-def format_message(payload: dict) -> str:
-    """Turn a Samsara webhook payload into a readable Telegram message."""
-    event_type = payload.get("eventType", "Unknown event")
-    data = payload.get("data", {})
+def find_all(node, wanted_key, _depth=0):
+    """Recursively find every dict stored under `wanted_key` anywhere in the payload."""
+    results = []
+    if _depth > 8:
+        return results
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k.lower() == wanted_key and isinstance(v, dict):
+                results.append(v)
+            results.extend(find_all(v, wanted_key, _depth + 1))
+    elif isinstance(node, list):
+        for item in node:
+            results.extend(find_all(item, wanted_key, _depth + 1))
+    return results
 
-    vehicle = data.get("vehicle", {}).get("name") or "Unknown vehicle"
-    driver = data.get("driver", {}).get("name") or "Unknown driver"
-    happened_at = payload.get("eventTime", "Unknown time")
 
-    lines = [
-        f"🚨 *Samsara Safety Alert*",
-        f"*Type:* {event_type}",
-        f"*Vehicle:* {vehicle}",
-        f"*Driver:* {driver}",
-        f"*Time:* {happened_at}",
-    ]
+def find_value(node, wanted_keys, _depth=0):
+    """Recursively find the first non-empty value stored under any of `wanted_keys`."""
+    if _depth > 8:
+        return None
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in wanted_keys and v not in (None, "", {}):
+                return v
+        for v in node.values():
+            found = find_value(v, wanted_keys, _depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = find_value(item, wanted_keys, _depth + 1)
+            if found is not None:
+                return found
+    return None
 
-    # Include a link to the event/dashcam clip if Samsara provides one
-    if data.get("url"):
-        lines.append(f"[View details]({data['url']})")
 
+_vehicle_name_cache = {}
+
+
+def lookup_vehicle_name(vehicle_id):
+    """If the webhook didn't include the truck name, ask the Samsara API for it."""
+    if not vehicle_id or not SAMSARA_API_TOKEN:
+        return None
+    if vehicle_id in _vehicle_name_cache:
+        return _vehicle_name_cache[vehicle_id]
+    try:
+        r = requests.get(f"{SAMSARA_API}/fleet/vehicles/{vehicle_id}",
+                         headers=samsara_headers(), timeout=10)
+        if r.ok:
+            name = dig(r.json(), "data", "name")
+            if name:
+                _vehicle_name_cache[vehicle_id] = name
+                return name
+    except Exception as e:
+        print("vehicle lookup error:", e)
+    return None
+
+
+def pretty_label(raw):
+    """Match an event type/description to a friendly emoji label."""
+    text = (raw or "").lower()
+    for keyword, label in EVENT_STYLES:
+        if keyword in text:
+            return label
+    # Fallback: split CamelCase into words, e.g. SpeedingEventStarted -> Speeding Event Started
+    words = []
+    current = ""
+    for ch in raw or "Alert":
+        if ch.isupper() and current:
+            words.append(current)
+            current = ch
+        else:
+            current += ch
+    if current:
+        words.append(current)
+    return "🔔 " + " ".join(words)
+
+
+def extract_alert(payload):
+    """
+    Pull the useful fields out of a Samsara alert webhook.
+    Samsara has a few payload shapes (Alert, AlertIncident, safety events);
+    this searches the whole payload recursively so nothing is missed.
+    """
+    event_type = payload.get("eventType", "")
+    data = payload.get("data") or payload.get("event") or payload
+
+    info = {
+        "kind": event_type,
+        "vehicle_id": None,
+        "vehicle_name": None,
+        "driver_name": None,
+        "behavior": None,
+        "lat": None,
+        "lng": None,
+        "description": None,
+        "event_time": payload.get("eventTime") or payload.get("eventMs"),
+    }
+
+    # Condition / trigger description
+    info["description"] = (
+        find_value(data, {"alertConditionDescription", "configurationDescription"})
+        or find_value(data, {"description"})
+        or find_value(data, {"eventType", "type"})
+        or event_type
+    )
+
+    # Vehicle - check every "vehicle"/"device"/"asset" object anywhere in the payload
+    for v in (find_all(data, "vehicle") + find_all(data, "device")
+              + find_all(data, "asset")):
+        info["vehicle_id"] = info["vehicle_id"] or v.get("id")
+        info["vehicle_name"] = info["vehicle_name"] or v.get("name")
+    if not info["vehicle_id"]:
+        info["vehicle_id"] = find_value(data, {"vehicleId", "assetId", "deviceId"})
+    if not info["vehicle_name"] and info["vehicle_id"]:
+        info["vehicle_name"] = lookup_vehicle_name(str(info["vehicle_id"]))
+
+    # Driver
+    for d in find_all(data, "driver"):
+        info["driver_name"] = info["driver_name"] or d.get("name")
+    if not info["driver_name"]:
+        info["driver_name"] = find_value(data, {"driverName"})
+
+    # Behavior label (safety events)
+    info["behavior"] = find_value(data, {"behaviorLabel", "behaviorLabels"})
+    if isinstance(info["behavior"], list):
+        info["behavior"] = ", ".join(
+            b.get("label", str(b)) if isinstance(b, dict) else str(b)
+            for b in info["behavior"]
+        )
+
+    # Location - any location/gps/address object with coordinates
+    for loc in (find_all(data, "location") + find_all(data, "gps")
+                + find_all(data, "address")):
+        info["lat"] = info["lat"] or loc.get("latitude") or loc.get("lat")
+        info["lng"] = info["lng"] or loc.get("longitude") or loc.get("lng")
+    if not info["lat"]:
+        info["lat"] = find_value(data, {"latitude"})
+        info["lng"] = find_value(data, {"longitude"})
+
+    return info
+
+
+def wants_video(info):
+    text = " ".join(filter(None, [info.get("behavior"), info.get("description")])).lower()
+    return any(k in text for k in VIDEO_BEHAVIORS)
+
+
+def local_time_str(event_time=None):
+    """Format the event time in Texas time, e.g. '09/14 08:18 PM CT'."""
+    t = None
+    try:
+        if isinstance(event_time, str):
+            t = datetime.fromisoformat(event_time.replace("Z", "+00:00"))
+        elif isinstance(event_time, (int, float)):
+            t = datetime.fromtimestamp(event_time / 1000, tz=timezone.utc)
+    except Exception:
+        t = None
+    if t is None:
+        t = datetime.now(timezone.utc)
+    return t.astimezone(LOCAL_TZ).strftime("%m/%d %I:%M %p CT")
+
+
+def format_alert(info):
+    label = pretty_label(info.get("behavior") or info.get("description")
+                         or info.get("kind"))
+    lines = [f"<b>{label}</b>"]
+    if info.get("vehicle_name"):
+        lines.append(f"🚛 Truck: <b>{info['vehicle_name']}</b>")
+    elif info.get("vehicle_id"):
+        lines.append(f"🚛 Truck ID: {info['vehicle_id']}")
+    if info.get("driver_name"):
+        lines.append(f"👤 Driver: <b>{info['driver_name']}</b>")
+    if info.get("lat") and info.get("lng"):
+        lines.append(
+            f'📍 <a href="https://www.google.com/maps?q={info["lat"]},{info["lng"]}">Open location on map</a>'
+        )
+    lines.append(f"🕐 {local_time_str(info.get('event_time'))}")
     return "\n".join(lines)
 
 
-def send_to_telegram(text: str):
-    resp = requests.post(
-        TELEGRAM_API_URL,
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": False,
-        },
-        timeout=10,
-    )
-    if not resp.ok:
-        log.error("Telegram send failed: %s %s", resp.status_code, resp.text)
-    resp.raise_for_status()
+def is_duplicate(info):
+    """True if we already sent an alert for this (vehicle, event) very recently."""
+    key = (str(info.get("vehicle_id") or info.get("vehicle_name") or "?"),
+           pretty_label(info.get("behavior") or info.get("description") or ""))
+    now = time.time()
+    with _recent_lock:
+        # drop old entries
+        for k in [k for k, v in _recent_alerts.items() if now - v > DEDUPE_SECONDS]:
+            del _recent_alerts[k]
+        if key in _recent_alerts:
+            return True
+        _recent_alerts[key] = now
+    return False
 
 
-@app.route("/samsara-webhook", methods=["POST"])
-def samsara_webhook():
-    raw_body = request.get_data()
-    signature = request.headers.get("X-Samsara-Signature", "")
-    timestamp = request.headers.get("X-Samsara-Timestamp", "")
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
-    if not verify_signature(raw_body, timestamp, signature):
-        log.warning("Rejected webhook with invalid signature")
-        return jsonify({"error": "invalid signature"}), 401
+@app.route("/", methods=["GET"])
+def health():
+    return "ok", 200
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    if SAMSARA_SIGNING_SECRET and not verify_signature(request):
+        abort(401)
 
     payload = request.get_json(silent=True) or {}
-    event_type = payload.get("eventType")
+    event_type = payload.get("eventType", "")
 
-    log.info("Received Samsara event: %s", event_type)
+    if event_type == "Ping":
+        return "", 200
 
-    if event_type not in SAFETY_EVENT_TYPES:
-        # Not a safety event we care about — acknowledge and ignore.
-        return jsonify({"status": "ignored"}), 200
+    info = extract_alert(payload)
 
-    try:
-        message = format_message(payload)
-        send_to_telegram(message)
-    except Exception as exc:
-        log.exception("Failed to relay event to Telegram")
-        return jsonify({"error": str(exc)}), 500
+    # Skip "...Ended" events - the group already saw the Started alert
+    raw_text = " ".join(filter(None, [
+        str(info.get("kind") or ""), str(info.get("description") or "")])).lower()
+    if SKIP_ENDED and "ended" in raw_text:
+        return "", 200
 
-    return jsonify({"status": "forwarded"}), 200
+    # Skip duplicates (e.g. Speeding + SevereSpeeding firing for the same moment)
+    if is_duplicate(info):
+        return "", 200
+
+    tg_send_text(format_alert(info))
+
+    # Queue dashcam retrieval for violation-type events
+    if wants_video(info) and info.get("vehicle_id"):
+        event_time = info.get("event_time")
+        try:
+            if isinstance(event_time, str):
+                event_time = datetime.fromisoformat(event_time.replace("Z", "+00:00"))
+            elif isinstance(event_time, (int, float)):
+                event_time = datetime.fromtimestamp(event_time / 1000, tz=timezone.utc)
+            else:
+                event_time = datetime.now(timezone.utc)
+        except Exception:
+            event_time = datetime.now(timezone.utc)
+        add_job(info["vehicle_id"], info.get("vehicle_name") or "?",
+                info.get("behavior") or info.get("description") or "violation",
+                event_time)
+
+    return "", 200
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
+# ---------------------------------------------------------------------------
+# Background worker: request + poll dashcam footage
+# ---------------------------------------------------------------------------
 
+def samsara_headers():
+    return {"Authorization": f"Bearer {SAMSARA_API_TOKEN}"}
+
+
+def request_media(job):
+    """Ask Samsara for ~20s of forward dashcam video around the event."""
+    start = job["event_time"] - timedelta(seconds=8)
+    end = job["event_time"] + timedelta(seconds=12)
+    body = {
+        "startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "endTime": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "vehicleId": str(job["vehicle_id"]),
+        "inputs": ["dashcamForward"],
+        "mediaType": "videoLowRes",   # low-res keeps files under Telegram's 50MB cap
+    }
+    r = requests.post(f"{SAMSARA_API}/cameras/media/retrieval",
+                      headers=samsara_headers(), json=body, timeout=30)
+    if r.ok:
+        rid = dig(r.json(), "data", "retrievalId")
+        print(f"Job {job['id']}: media requested, retrievalId={rid}")
+        return rid
+    print(f"Job {job['id']}: media request failed {r.status_code} {r.text[:300]}")
+    return None
+
+
+def poll_media(job):
+    """Check whether the requested clip is ready; send it if so. Returns True when done."""
+    r = requests.get(f"{SAMSARA_API}/cameras/media/retrieval",
+                     headers=samsara_headers(),
+                     params={"retrievalId": job["retrieval_id"]}, timeout=30)
+    if not r.ok:
+        print(f"Job {job['id']}: poll failed {r.status_code} {r.text[:300]}")
+        return False
+    for m in dig(r.json(), "data", "media", default=[]) or []:
+        if m.get("status", "").lower() == "available":
+            url = dig(m, "urlInfo", "url") or m.get("url")
+            if url:
+                caption = (f"🎥 {job['behavior']} — {job['vehicle_name']} "
+                           f"({job['event_time'].strftime('%m/%d %H:%M UTC')})")
+                tg_send_video(url, caption)
+                return True
+    return False
+
+
+def worker_loop():
+    while True:
+        try:
+            for job in due_jobs():
+                attempts = job["attempts"] + 1
+                if attempts > 20:  # ~ up to a few hours of retries, then give up
+                    update_job(job["id"], status="failed")
+                    tg_send_text(
+                        f"⚠️ Could not retrieve video for {job['behavior']} — "
+                        f"{job['vehicle_name']}. Camera may be offline; "
+                        f"check Samsara Video Library."
+                    )
+                    continue
+                if not job["retrieval_id"]:
+                    rid = request_media(job)
+                    if rid:
+                        update_job(job["id"], retrieval_id=rid, status="requested",
+                                   attempts=attempts,
+                                   next_check=datetime.now(timezone.utc) + timedelta(minutes=2))
+                    else:
+                        update_job(job["id"], attempts=attempts,
+                                   next_check=datetime.now(timezone.utc) + timedelta(minutes=5))
+                else:
+                    if poll_media(job):
+                        update_job(job["id"], status="done", attempts=attempts)
+                    else:
+                        update_job(job["id"], attempts=attempts,
+                                   next_check=datetime.now(timezone.utc) + timedelta(minutes=3))
+        except Exception as e:
+            print("worker error:", e)
+        time.sleep(60)
+
+
+init_store()
+threading.Thread(target=worker_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    missing = [
-        name
-        for name, val in [
-            ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
-            ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
-        ]
-        if not val
-    ]
-    if missing:
-        raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
-
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
