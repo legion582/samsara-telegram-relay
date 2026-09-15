@@ -52,7 +52,7 @@ VIDEO_BEHAVIORS = [
     if s.strip()
 ]
 
-LOCAL_TZ = ZoneInfo(os.environ.get("LOCAL_TZ", "America/Chicago"))  # Texas time
+LOCAL_TZ = ZoneInfo(os.environ.get("LOCAL_TZ", "America/New_York"))  # Eastern time
 
 # Skip "...Ended" events by default - the Started alert already told the group
 SKIP_ENDED = os.environ.get("SKIP_ENDED", "true").lower() == "true"
@@ -72,6 +72,8 @@ EVENT_STYLES = [
     ("geofence exit",  "🚧 Left Zone"),
     ("geofence",       "🚧 Restricted Zone Alert"),
     ("stopped",        "🅿️⏱ Stopped 15+ min"),
+    ("stops moving",   "🅿️⏱ Stopped 15+ min"),
+    ("low bridge",     "🌉⚠️ LOW BRIDGE AHEAD"),
     ("idle",           "🅿️⏱ Idling Alert"),
     ("phone",          "📵 Phone Use While Driving"),
     ("seatbelt",       "🔴 No Seatbelt"),
@@ -329,8 +331,9 @@ def lookup_vehicle_name(vehicle_id):
 def pretty_label(raw):
     """Match an event type/description to a friendly emoji label."""
     text = (raw or "").lower()
+    squashed = text.replace(" ", "")
     for keyword, label in EVENT_STYLES:
-        if keyword in text:
+        if keyword in text or keyword.replace(" ", "") in squashed:
             return label
     # Fallback: split CamelCase into words, e.g. SpeedingEventStarted -> Speeding Event Started
     words = []
@@ -428,7 +431,7 @@ def local_time_str(event_time=None):
         t = None
     if t is None:
         t = datetime.now(timezone.utc)
-    return t.astimezone(LOCAL_TZ).strftime("%m/%d %I:%M %p CT")
+    return t.astimezone(LOCAL_TZ).strftime("%m/%d %I:%M %p ET")
 
 
 def format_alert(info):
@@ -473,6 +476,86 @@ def health():
     return "ok", 200
 
 
+def enrich_safety_event(info):
+    """
+    Samsara's safety-event webhooks only say 'a safety event occurred' - the
+    behavior (harsh braking, following distance, ...) and location must be
+    fetched from the Safety Events API. Retries a few times because the event
+    can take up to ~1 min to appear in the API after the webhook fires.
+    """
+    if not SAMSARA_API_TOKEN:
+        return
+    for attempt in range(4):  # ~0s, 15s, 30s, 45s
+        if attempt:
+            time.sleep(15)
+        try:
+            now = datetime.now(timezone.utc)
+            params = {
+                "startTime": (now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endTime": (now + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            r = requests.get(f"{SAMSARA_API}/fleet/safety-events",
+                             headers=samsara_headers(), params=params, timeout=15)
+            if not r.ok:
+                print("safety-events fetch failed:", r.status_code, r.text[:200])
+                continue
+            events = dig(r.json(), "data", default=[]) or []
+            best = None
+            for ev in events:
+                v = find_all(ev, "vehicle")
+                v_id = str(v[0].get("id")) if v else str(find_value(ev, {"vehicleId"}) or "")
+                v_name = (v[0].get("name") if v else None) or ""
+                if (info.get("vehicle_id") and v_id == str(info["vehicle_id"])) or \
+                   (info.get("vehicle_name") and v_name == info["vehicle_name"]):
+                    best = ev  # events are time-ordered; keep the last match
+            if best:
+                labels = find_value(best, {"behaviorLabels", "behaviorLabel"})
+                if isinstance(labels, list):
+                    names = [b.get("name") or b.get("label", "") if isinstance(b, dict)
+                             else str(b) for b in labels]
+                    info["behavior"] = ", ".join(n for n in names if n) or info["behavior"]
+                elif labels:
+                    info["behavior"] = str(labels)
+                for loc in find_all(best, "location"):
+                    info["lat"] = info["lat"] or loc.get("latitude") or loc.get("lat")
+                    info["lng"] = info["lng"] or loc.get("longitude") or loc.get("lng")
+                if not info.get("driver_name"):
+                    d = find_all(best, "driver")
+                    if d:
+                        info["driver_name"] = d[0].get("name")
+                if info.get("behavior"):
+                    return
+        except Exception as e:
+            print("enrich error:", e)
+
+
+def process_alert(info):
+    """Runs in a background thread so the webhook can answer Samsara instantly."""
+    try:
+        desc = (info.get("description") or "").lower()
+        if "safety event" in desc and not info.get("behavior"):
+            enrich_safety_event(info)
+
+        tg_send_text(format_alert(info))
+
+        if wants_video(info) and info.get("vehicle_id"):
+            event_time = info.get("event_time")
+            try:
+                if isinstance(event_time, str):
+                    event_time = datetime.fromisoformat(event_time.replace("Z", "+00:00"))
+                elif isinstance(event_time, (int, float)):
+                    event_time = datetime.fromtimestamp(event_time / 1000, tz=timezone.utc)
+                else:
+                    event_time = datetime.now(timezone.utc)
+            except Exception:
+                event_time = datetime.now(timezone.utc)
+            add_job(info["vehicle_id"], info.get("vehicle_name") or "?",
+                    info.get("behavior") or info.get("description") or "violation",
+                    event_time)
+    except Exception as e:
+        print("process_alert error:", e)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if SAMSARA_SIGNING_SECRET and not verify_signature(request):
@@ -496,23 +579,8 @@ def webhook():
     if is_duplicate(info):
         return "", 200
 
-    tg_send_text(format_alert(info))
-
-    # Queue dashcam retrieval for violation-type events
-    if wants_video(info) and info.get("vehicle_id"):
-        event_time = info.get("event_time")
-        try:
-            if isinstance(event_time, str):
-                event_time = datetime.fromisoformat(event_time.replace("Z", "+00:00"))
-            elif isinstance(event_time, (int, float)):
-                event_time = datetime.fromtimestamp(event_time / 1000, tz=timezone.utc)
-            else:
-                event_time = datetime.now(timezone.utc)
-        except Exception:
-            event_time = datetime.now(timezone.utc)
-        add_job(info["vehicle_id"], info.get("vehicle_name") or "?",
-                info.get("behavior") or info.get("description") or "violation",
-                event_time)
+    # Enrich + send in the background so Samsara gets an instant 200 OK
+    threading.Thread(target=process_alert, args=(info,), daemon=True).start()
 
     return "", 200
 
