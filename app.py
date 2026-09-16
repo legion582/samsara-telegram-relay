@@ -36,6 +36,11 @@ from flask import Flask, request, abort
 
 app = Flask(__name__)
 
+def log(*args):
+    """Print immediately - gunicorn buffers stdout otherwise, hiding these lines."""
+    print(*args, flush=True)
+
+
 SAMSARA_SIGNING_SECRET = os.environ.get("SAMSARA_SIGNING_SECRET", "")
 SAMSARA_API_TOKEN = os.environ.get("SAMSARA_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -113,7 +118,7 @@ def _pg():
 
 def init_store():
     if not DATABASE_URL:
-        print("WARNING: DATABASE_URL not set - video jobs held in memory only.")
+        log("WARNING: DATABASE_URL not set - video jobs held in memory only.")
         return
     with _pg().cursor() as cur:
         cur.execute(
@@ -210,9 +215,9 @@ def tg_send_text(text):
             timeout=15,
         )
         if not r.ok:
-            print("Telegram sendMessage failed:", r.status_code, r.text[:300])
+            log("Telegram sendMessage failed:", r.status_code, r.text[:300])
     except Exception as e:
-        print("Telegram sendMessage error:", e)
+        log("Telegram sendMessage error:", e)
 
 
 def tg_send_video(url, caption):
@@ -229,12 +234,12 @@ def tg_send_video(url, caption):
             )
             if r.ok:
                 return True
-            print("Telegram sendVideo failed:", r.status_code, r.text[:300])
+            log("Telegram sendVideo failed:", r.status_code, r.text[:300])
         # Too big or upload failed: send the (8-hour) link instead
         tg_send_text(f"{caption}\nVideo (link expires in 8h): {url}")
         return True
     except Exception as e:
-        print("tg_send_video error:", e)
+        log("tg_send_video error:", e)
         tg_send_text(f"{caption}\nVideo (link expires in 8h): {url}")
         return True
 
@@ -324,7 +329,7 @@ def lookup_vehicle_name(vehicle_id):
                 _vehicle_name_cache[vehicle_id] = name
                 return name
     except Exception as e:
-        print("vehicle lookup error:", e)
+        log("vehicle lookup error:", e)
     return None
 
 
@@ -497,7 +502,7 @@ def enrich_safety_event(info):
             r = requests.get(f"{SAMSARA_API}/fleet/safety-events",
                              headers=samsara_headers(), params=params, timeout=15)
             if not r.ok:
-                print("safety-events fetch failed:", r.status_code, r.text[:200])
+                log("safety-events fetch failed:", r.status_code, r.text[:200])
                 continue
             events = dig(r.json(), "data", default=[]) or []
             best = None
@@ -526,7 +531,7 @@ def enrich_safety_event(info):
                 if info.get("behavior"):
                     return
         except Exception as e:
-            print("enrich error:", e)
+            log("enrich error:", e)
 
 
 def process_alert(info):
@@ -552,8 +557,13 @@ def process_alert(info):
             add_job(info["vehicle_id"], info.get("vehicle_name") or "?",
                     info.get("behavior") or info.get("description") or "violation",
                     event_time)
+            log(f"VIDEO: queued job for {info.get('vehicle_name')} "
+                f"({info.get('behavior') or info.get('description')}) at {event_time}")
+        else:
+            log(f"VIDEO: no job - behavior='{info.get('behavior')}' "
+                f"desc='{info.get('description')}' vehicle_id={info.get('vehicle_id')}")
     except Exception as e:
-        print("process_alert error:", e)
+        log("process_alert error:", e)
 
 
 @app.route("/webhook", methods=["POST"])
@@ -604,13 +614,14 @@ def request_media(job):
         "inputs": ["dashcamForward"],
         "mediaType": "videoLowRes",   # low-res keeps files under Telegram's 50MB cap
     }
+    log(f"VIDEO: requesting media {body}")
     r = requests.post(f"{SAMSARA_API}/cameras/media/retrieval",
                       headers=samsara_headers(), json=body, timeout=30)
     if r.ok:
         rid = dig(r.json(), "data", "retrievalId")
-        print(f"Job {job['id']}: media requested, retrievalId={rid}")
+        log(f"VIDEO: job {job['id']} media requested OK, retrievalId={rid}")
         return rid
-    print(f"Job {job['id']}: media request failed {r.status_code} {r.text[:300]}")
+    log(f"VIDEO: job {job['id']} media request FAILED {r.status_code}: {r.text[:500]}")
     return None
 
 
@@ -620,9 +631,12 @@ def poll_media(job):
                      headers=samsara_headers(),
                      params={"retrievalId": job["retrieval_id"]}, timeout=30)
     if not r.ok:
-        print(f"Job {job['id']}: poll failed {r.status_code} {r.text[:300]}")
+        log(f"VIDEO: job {job['id']} poll FAILED {r.status_code}: {r.text[:500]}")
         return False
-    for m in dig(r.json(), "data", "media", default=[]) or []:
+    media = dig(r.json(), "data", "media", default=[]) or []
+    log(f"VIDEO: job {job['id']} poll - {len(media)} media entries, "
+        f"statuses={[m.get('status') for m in media]}")
+    for m in media:
         if m.get("status", "").lower() == "available":
             url = dig(m, "urlInfo", "url") or m.get("url")
             if url:
@@ -662,7 +676,7 @@ def worker_loop():
                         update_job(job["id"], attempts=attempts,
                                    next_check=datetime.now(timezone.utc) + timedelta(minutes=3))
         except Exception as e:
-            print("worker error:", e)
+            log("worker error:", e)
         time.sleep(60)
 
 
