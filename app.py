@@ -420,7 +420,20 @@ def extract_alert(payload):
 
 
 def wants_video(info):
-    text = " ".join(filter(None, [info.get("behavior"), info.get("description")])).lower()
+    """
+    Decide whether to pull dashcam footage.
+    VIDEO_BEHAVIORS="*" (or "all") means: every safety event (anything that came
+    back with a behavior label, or whose description says a safety event occurred).
+    Stop/idle/geofence alerts never request video - only safety events do.
+    """
+    behavior = (info.get("behavior") or "").strip()
+    desc = (info.get("description") or "")
+    text = f"{behavior} {desc}".lower()
+
+    if any(k in ("*", "all") for k in VIDEO_BEHAVIORS):
+        # catch-all, but only for genuine safety events
+        return bool(behavior) or "safety event" in desc.lower()
+
     return any(k in text for k in VIDEO_BEHAVIORS)
 
 
